@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.db
+data/embeddings/
+*.egg-info/
+dist/
+build/
+.DS_Store
