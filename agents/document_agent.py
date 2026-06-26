@@ -12,10 +12,11 @@ load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.75))
 
-# adding more categories here as we onboard new clients
+# expanded categories — resume was falling through to unknown before
 DOC_CATEGORIES = [
     "financial_statement", "insurance_claim", "loan_application",
-    "audit_evidence", "healthcare_record", "legal_contract", "invoice", "unknown"
+    "audit_evidence", "healthcare_record", "legal_contract",
+    "invoice", "resume_cv", "report", "email", "unknown"
 ]
 
 EXTRACT_TOOLS = [{
@@ -24,11 +25,19 @@ EXTRACT_TOOLS = [{
     "input_schema": {
         "type": "object",
         "properties": {
-            "category": {"type": "string", "enum": DOC_CATEGORIES},
-            "confidence": {"type": "number"},
+            "category": {
+                "type": "string",
+                "enum": DOC_CATEGORIES,
+                "description": "Document category. Use resume_cv for resumes, CVs, job applications."
+            },
+            "confidence": {"type": "number", "description": "0.0-1.0 confidence in classification"},
             "key_entities": {"type": "array", "items": {"type": "string"}},
             "summary": {"type": "string"},
-            "risk_indicators": {"type": "array", "items": {"type": "string"}},
+            "risk_indicators": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only flag genuine anomalies relevant to the document type. Do not flag resumes as high risk."
+            },
             "anomaly_detected": {"type": "boolean"}
         },
         "required": ["category", "confidence", "key_entities", "summary", "anomaly_detected"]
@@ -57,22 +66,36 @@ def read_file(path: str) -> tuple[str, str]:
 
 
 def classify(text: str, filename: str) -> dict:
-    # 8k chars is enough for most docs, never seen a case where more helped
+    # 8k chars is enough for most docs
     snippet = text[:8000] + ("..." if len(text) > 8000 else "")
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
-        system="Enterprise document classifier. Use classify_document tool. Be conservative on anomaly flags — false positives waste reviewer time.",
+        system="""Enterprise document classifier. Use classify_document tool.
+Category guidance:
+- resume_cv: any resume, CV, job application, professional profile
+- invoice: bills, purchase orders, payment requests
+- financial_statement: balance sheets, income statements, financial reports
+- insurance_claim: insurance forms, claim submissions
+- loan_application: loan forms, mortgage applications, credit applications
+- audit_evidence: audit reports, compliance documents
+- healthcare_record: medical records, patient documents, clinical notes
+- legal_contract: contracts, agreements, legal documents
+- report: analytical reports, research, summaries
+- email: email correspondence
+
+Risk indicators: only flag genuine anomalies relevant to the document type.
+Resumes should almost never have risk indicators.""",
         tools=EXTRACT_TOOLS,
-        messages=[{"role": "user", "content": f"Classify and extract from this doc.\n\nFile: {filename}\n\n{snippet}"}]
+        messages=[{"role": "user", "content": f"Classify and extract from this document.\n\nFile: {filename}\n\n{snippet}"}]
     )
 
     for block in resp.content:
         if block.type == "tool_use" and block.name == "classify_document":
             return block.input
 
-    # TODO: add retry with temp=0 if this happens again in prod
+    # TODO: add retry
     logger.warning(f"Claude skipped tool call on {filename}, using fallback")
     return {
         "category": "unknown", "confidence": 0.5,

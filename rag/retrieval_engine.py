@@ -12,9 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# using tfidf locally so we don't need to download models in dev
-# switching to openai text-embedding-3-small before going to prod
-# had issues with onnx model checksums in the container environment
+# using tfidf locally — swap for openai text-embedding-3-small in prod
 class LocalEmbeddings(EmbeddingFunction):
     def __init__(self):
         self.vec = TfidfVectorizer(max_features=512, ngram_range=(1,2), sublinear_tf=True)
@@ -24,7 +22,6 @@ class LocalEmbeddings(EmbeddingFunction):
         self._docs.extend(input)
         self.vec.fit(list(set(self._docs)))
         mat = self.vec.transform(input).toarray()
-        # pad to 128 dims
         if mat.shape[1] < 128:
             mat = np.hstack([mat, np.zeros((mat.shape[0], 128 - mat.shape[1]))])
         else:
@@ -35,6 +32,12 @@ class LocalEmbeddings(EmbeddingFunction):
 
 _chroma = chromadb.Client()
 _emb = LocalEmbeddings()
+
+# categories that should be checked against fraud patterns
+FINANCIAL_CATEGORIES = {
+    "financial_statement", "invoice", "insurance_claim",
+    "loan_application", "audit_evidence"
+}
 
 
 def _col(name: str):
@@ -73,7 +76,9 @@ def search(query: str, col="fraud_patterns", n=5, cat: Optional[str]=None) -> li
         )
         return [
             {"rank": i+1, "text": d, "meta": m, "score": round(max(0, 1-dist), 4)}
-            for i, (d, m, dist) in enumerate(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))
+            for i, (d, m, dist) in enumerate(zip(
+                res["documents"][0], res["metadatas"][0], res["distances"][0]
+            ))
         ]
     except Exception as e:
         logger.warning(f"search failed: {e}")
@@ -87,7 +92,7 @@ def rerank(query: str, hits: list[dict]) -> list[dict]:
     try:
         resp = client.messages.create(
             model="claude-sonnet-4-6", max_tokens=128,
-            messages=[{"role": "user", "content": f"Rerank by relevance to: {query}\n\n{passages}\n\nJSON array only, e.g. [2,1,3]"}]
+            messages=[{"role": "user", "content": f"Rerank by relevance to: {query}\n\n{passages}\n\nJSON array only e.g. [2,1,3]"}]
         )
         txt = resp.content[0].text
         order = json.loads(txt[txt.find("["):txt.find("]")+1])
@@ -100,6 +105,18 @@ def rerank(query: str, hits: list[dict]) -> list[dict]:
 
 
 def verify_with_rag(document_text: str, structured_output: dict, category: str) -> dict:
+    # only run fraud checks on financial/business documents
+    # resumes, emails, reports don't need fraud pattern matching
+    if category not in FINANCIAL_CATEGORIES:
+        return {
+            "verification_report": f"Document type '{category}' — standard verification. No fraud pattern matching required for this category.",
+            "risk_level": "low",
+            "sources_cited": [],
+            "compliance_flags": [],
+            "fraud_pattern_matches": 0,
+            "used_context": False
+        }
+
     q = f"{category} {structured_output.get('summary','')} {' '.join(structured_output.get('risk_indicators',[]))}"
 
     fraud_hits = rerank(q, search(q, "fraud_patterns", n=5))

@@ -6,25 +6,41 @@ from typing import Optional
 from anthropic import Anthropic
 from loguru import logger
 from dotenv import load_dotenv
-from utils.models import Evaluation, GoldenSet, ModelDriftAlert, ReviewQueueItem, Document, DocumentStatus, get_session
+from utils.models import (
+    Evaluation, GoldenSet, ModelDriftAlert, ReviewQueueItem,
+    Document, DocumentStatus, get_session
+)
 
 load_dotenv()
 
 _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 CONF_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.75))
 DRIFT_THRESHOLD = 0.10
-DRIFT_WINDOW = 7  # days
+DRIFT_WINDOW = 7
 
+# explicit about the scale — claude was returning 0-10 before
 _JUDGE_TOOL = [{
     "name": "score_output",
-    "description": "Score LLM output quality",
+    "description": "Score LLM output quality. ALL scores must be decimal values between 0.0 and 1.0. Do not use a 0-10 scale.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "correctness_score": {"type": "number"},
-            "faithfulness_score": {"type": "number"},
-            "completeness_score": {"type": "number"},
-            "hallucination_risk_score": {"type": "number"},
+            "correctness_score": {
+                "type": "number",
+                "description": "MUST be between 0.0 and 1.0. Is the output factually correct based on source?"
+            },
+            "faithfulness_score": {
+                "type": "number",
+                "description": "MUST be between 0.0 and 1.0. Does output avoid hallucinating facts not in source?"
+            },
+            "completeness_score": {
+                "type": "number",
+                "description": "MUST be between 0.0 and 1.0. Does output cover all key aspects?"
+            },
+            "hallucination_risk_score": {
+                "type": "number",
+                "description": "MUST be between 0.0 and 1.0. Higher = more hallucination risk detected."
+            },
             "reasoning": {"type": "string"},
             "specific_issues": {"type": "array", "items": {"type": "string"}}
         },
@@ -33,33 +49,64 @@ _JUDGE_TOOL = [{
 }]
 
 
+def _clamp(val, lo=0.0, hi=1.0):
+    """safety net — clamp any score that slips out of range"""
+    if val is None:
+        return 0.5
+    v = float(val)
+    # if claude returned 0-10 scale, normalize it
+    if v > 1.0:
+        v = v / 10.0
+    return max(lo, min(hi, round(v, 4)))
+
+
 def _judge(source: str, output: dict, category: str) -> dict:
     resp = _client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=512,
-        system="Quality evaluator. Score objectively. Only penalize real errors. Use score_output.",
+        system="""You are a quality evaluator for enterprise AI systems.
+Score outputs on a 0.0 to 1.0 scale ONLY. Never use scores above 1.0.
+Examples: good correctness = 0.85, poor faithfulness = 0.30, high hallucination risk = 0.70.
+Use the score_output tool.""",
         tools=_JUDGE_TOOL,
-        messages=[{"role": "user", "content": f"Evaluate {category} output.\n\nSource:\n{source[:1500]}\n\nOutput:\n{json.dumps(output)[:1500]}\n\nScore it."}]
+        messages=[{
+            "role": "user",
+            "content": f"Evaluate this {category} output.\n\nSource:\n{source[:1500]}\n\nOutput:\n{json.dumps(output)[:1500]}\n\nScore all dimensions 0.0-1.0 using score_output tool."
+        }]
     )
 
     for b in resp.content:
         if b.type == "tool_use" and b.name == "score_output":
             s = b.input
-            # correctness + faithfulness carry the most weight for regulated docs
-            s["overall"] = round(s["correctness_score"]*0.35 + s["faithfulness_score"]*0.35 + s["completeness_score"]*0.20 + (1-s["hallucination_risk_score"])*0.10, 4)
-            return s
+            # clamp everything just in case
+            cor = _clamp(s.get("correctness_score"))
+            fai = _clamp(s.get("faithfulness_score"))
+            com = _clamp(s.get("completeness_score"))
+            hal = _clamp(s.get("hallucination_risk_score"))
+            overall = round(cor*0.35 + fai*0.35 + com*0.20 + (1-hal)*0.10, 4)
+            return {
+                "correctness_score": cor,
+                "faithfulness_score": fai,
+                "completeness_score": com,
+                "hallucination_risk_score": hal,
+                "overall": overall,
+                "reasoning": s.get("reasoning", ""),
+                "specific_issues": s.get("specific_issues", [])
+            }
 
-    # FIXME: happens maybe 1 in 50 calls, need to add retry
-    logger.warning("judge skipped tool call")
-    return {"correctness_score": 0.5, "faithfulness_score": 0.5, "completeness_score": 0.5,
-            "hallucination_risk_score": 0.5, "overall": 0.5, "reasoning": "eval failed", "specific_issues": []}
+    # TODO: retry logic here
+    logger.warning("judge skipped tool call, using fallback")
+    return {
+        "correctness_score": 0.5, "faithfulness_score": 0.5,
+        "completeness_score": 0.5, "hallucination_risk_score": 0.5,
+        "overall": 0.5, "reasoning": "eval failed", "specific_issues": []
+    }
 
 
 def _golden_compare(output: dict, category: str, session) -> Optional[dict]:
     examples = session.query(GoldenSet).filter_by(document_category=category).limit(3).all()
     if not examples:
         return None
-
     ex_str = "\n".join(f"Ex{i+1}: {json.dumps(e.expected_output)[:200]}" for i, e in enumerate(examples))
     try:
         resp = _client.messages.create(
