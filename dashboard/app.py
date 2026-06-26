@@ -17,7 +17,8 @@ page = st.sidebar.radio("Navigation", [
     "⚠️ Drift Alerts"
 ])
 st.sidebar.divider()
-st.sidebar.caption("Built with Claude API · LangChain · ChromaDB")
+st.sidebar.caption("Built by Yuvaraj Thatiparthi")
+st.sidebar.caption("Claude API · LangChain · ChromaDB · FastAPI")
 
 def risk_color(level):
     return {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(level, "⚪")
